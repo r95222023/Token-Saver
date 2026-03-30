@@ -1,0 +1,34 @@
+﻿【步驟 1】只過濾
+============================================================
+查詢：Python asyncio 如何實現並發程式設計？
+Chunks 總數：16
+
+=== 存活的 Chunks ===
+  [1] Python 的 asyncio 函式庫允許使用 async/await 語法撰寫並發程式碼。
+  [2] asyncio.gather() 函式可並發執行多個協程，並返回結果列表。
+  [3] AsyncIO 事件迴圈負責管理和調度 Python 程式中的非同步任務。
+  [4] 若要執行 async 函式，在 Python 3.7+ 中可使用 asyncio.run() 作為入口點。
+
+=== 統計 ===
+  rounds=4 | api_calls=12 | chunks: 16 → 4 (12 pruned)
+
+============================================================
+
+【步驟 2】完整 pipeline（過濾 + 回答）
+============================================================
+查詢：Python asyncio 如何實現並發程式設計？
+
+=== 回答 ===
+Python asyncio 通過以下方式實現並發程式設計：
+
+*   **async/await 語法**: 允許使用 `async` 和 `await` 關鍵字來編寫並發程式碼。（Source 1）
+*   **協程**: 使用 `asyncio.gather()` 函式可以並發執行多個協程，並返回結果列表。（Source 2）
+*   **事件迴圈**: `AsyncIO` 事件迴圈負責管理和調度非同步任務。（Source 3）
+*   **入口點**: 使用 `asyncio.run()` 函式（Python 3.7+）執行 `async` 函式。（Source 4）
+
+
+
+
+
+=== 統計 ===
+  rounds=4 | api_calls=12 | chunks: 16 → 4 (12 pruned)

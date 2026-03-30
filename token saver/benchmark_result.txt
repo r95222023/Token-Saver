@@ -1,0 +1,27 @@
+﻿Loading sherlock.txt...
+Total Chunks: 32
+Query: Who is the King of Bohemia and what does he want from Sherlock Holmes?
+
+--- [Strategy A] Divide & Conquer ---
+Stats: rounds=4 | api_calls=22 | chunks: 32 → 32 (0 pruned)
+Time: 122.07s
+
+--- [Strategy B] Marker Streaming ---
+Stats: rounds=1 | api_calls=1 | chunks: 32 → 32 (0 pruned)
+Time: 14.29s
+
+--- [Strategy C] Parallel Marker (4 workers) ---
+Stats: rounds=1 | api_calls=4 | chunks: 32 → 32 (0 pruned)
+Time: 40.09s
+
+--- Final Answer (using Strategy B survivors) ---
+Answer:
+This question refers to a different Sherlock Holmes story, "A Scandal in Bohemia." Here's the answer:
+
+The King of Bohemia is Wilhelm, the reigning monarch. He is a man of great passions and has a scandalous secret: he is secretly married to Irene Adler, an opera singer. However, he needs to retrieve compromising photographs of himself and Adler before his planned marriage to another princess.
+
+He wants Sherlock Holmes to retrieve these photographs from Adler, as they could ruin his reputation and prevent his politically important marriage. He is willing to pay a substantial sum for Holmes's services.
+
+
+
+
