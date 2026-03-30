@@ -1,188 +1,203 @@
-# Prompt Skipper
+# Token Saver (Prompt Skipper)
 
-分治法 RAG 過濾器：用 O(log N) 輪平行 API 呼叫，從大量 chunks 中快速篩出真正相關的內容。
-
----
-
-## 問題背景
-
-RAG（Retrieval-Augmented Generation）系統的常見做法：
-
-```
-向量搜尋 → 取 top-K chunks → 全部塞進 prompt → 讓 LLM 回答
-```
-
-這個流程有三個缺點：
-
-| 問題 | 說明 |
-|------|------|
-| **Token 浪費** | top-K 裡有大量不相關內容，卻佔用 context window |
-| **品質下降** | 無關資訊會干擾模型，導致回答品質降低（Lost in the Middle 問題） |
-| **成本增加** | 輸入 token 越多，API 費用越高 |
-
-常見的解法是 **Re-ranking**（重新排序後取前 N 名），但這依然是序列式的 O(N) 操作。
+A RAG context filter that uses **O(log N) parallel API rounds** to quickly prune irrelevant chunks before sending them to your LLM — saving tokens, reducing cost, and improving answer quality.
 
 ---
 
-## 核心概念：分治篩選
+## The Problem
 
-Prompt Skipper 借鑑二元搜尋的思路，把 chunks 視為一棵二元樹：
+A typical RAG pipeline looks like this:
 
 ```
-                    [全部 16 個 chunks]
-                   相關？YES → 繼續拆分
-                  /                    \
-        [前 8 個]                    [後 8 個]
-       YES ↓        NO ✗           YES ↓     NO ✗
-      [前 4 個]  (丟棄)          [後 4 個]  (丟棄)
-      YES ↓                      NO ✗
-    [前 2 個]                  (丟棄)
-    YES↓  NO✗
-  [chunk1] (丟棄)
+vector search → top-K chunks → stuff all into prompt → LLM answers
 ```
 
-**關鍵優勢**：每一層的所有檢查都是**平行**執行的。
+This has three issues:
+
+| Problem | Details |
+|---------|---------|
+| **Token waste** | top-K results contain lots of irrelevant content that still occupies the context window |
+| **Quality drop** | Noise interferes with the model ("Lost in the Middle" problem) |
+| **Higher cost** | More input tokens = higher API bills |
+
+Re-ranking (sort and take top-N) is the common fix, but it's still a sequential O(N) operation.
 
 ---
 
-## 演算法細節
+## Three Filtering Strategies
 
-### 遞迴邏輯
+### Strategy A — Divide & Conquer (`filter_chunks`)
+
+Treats chunks like a binary tree. Each level's checks run **in parallel**:
+
+```
+              [all 16 chunks]
+             relevant? YES → split
+            /                    \
+      [first 8]              [last 8]
+     YES ↓   NO ✗          YES ↓   NO ✗
+   [first 4] (discard)   [last 4] (discard)
+   YES ↓                    NO ✗
+ [first 2]               (discard)
+ YES↓  NO✗
+[chunk1] (discard)
+```
+
+**Complexity:**
+
+| Metric | Sequential scan | Strategy A |
+|--------|----------------|------------|
+| API rounds | O(N) | O(log N) |
+| Worst-case calls | N | 2N − 1 |
+| Best-case calls | N | 2 |
+| Parallelism | None | Full per round |
+
+> 1024 chunks → at most **10 rounds** instead of 1024.
+
+---
+
+### Strategy B — Marker Streaming (`filter_chunks_by_marker`)
+
+1. Tag each chunk with a unique marker: `[§0]`, `[§1]`, …
+2. Send all chunks in **one API call**: "stream back the markers of irrelevant chunks"
+3. As each `[§N]` token arrives → drop that chunk immediately
+4. As soon as `[DONE]` is received → **abort the stream**, don't wait for the full response
+
+**Complexity:** 1 API call, output ≈ `(irrelevant_count × 5)` tokens
+
+---
+
+### Strategy C — Parallel Marker Streaming (`filter_chunks_by_marker_parallel`)
+
+Combines Strategy B with parallelism:
+
+1. Split chunks into N partitions
+2. Fire N marker-streaming calls **in parallel** via `asyncio.gather()`
+3. Each worker stops as soon as it sees `[DONE]`
+4. Merge surviving chunks back in original order
+
+---
+
+## Benchmark Results
+
+Tested on the complete **Sherlock Holmes** collection (~593 KB, ~200K tokens),
+split into 32 chunks (~18 KB / 5,000 words each),
+using a local Ollama `gemma3:27b` server.
+
+Query: *"Who is the King of Bohemia and what does he want?"*
+
+| Metric | Strategy A (Divide & Conquer) | Strategy B (Marker Stream) | Strategy C (Parallel Marker) |
+|--------|-------------------------------|----------------------------|-------------------------------|
+| API calls | 22 (4 rounds) | 1 | 4 (parallel) |
+| Elapsed time | 122.07 s | **14.29 s** | 40.09 s |
+| Speedup vs A | baseline | **8.5×** | 3× |
+
+**Why is Strategy B fastest for large files?**
+Strategy A must re-read overlapping context across multiple grouped queries.
+Strategy B reads everything once and streams back only the short marker tokens,
+then aborts the connection early — minimal redundant inference.
+
+**Pruning accuracy test** ("How do I make a lava chocolate cake?" → detective novel):
+> chunks: 32 → **1** (31 pruned — **97% pruned**, correct result)
+
+---
+
+## Quick Start
+
+```bash
+pip install openai
+```
 
 ```python
-async def filter(chunks, query):
-    if len(chunks) <= leaf_size:          # 1. 到達葉節點 → 直接檢查
-        return chunks if relevant else []
+import asyncio
+from token_saver.prompt_skipper import ask, SkipperConfig
 
-    left, right = split(chunks)            # 2. 對半切分
-
-    left_rel, right_rel = await parallel(  # 3. 平行檢查兩半
-        check(left, query),
-        check(right, query),
-    )
-
-    left_result, right_result = await parallel(  # 4. 平行遞迴相關的部分
-        filter(left) if left_rel else [],
-        filter(right) if right_rel else [],
-    )
-
-    return left_result + right_result      # 5. 合併結果
-```
-
-### 複雜度分析
-
-設 N = chunk 數量，R = 實際相關的 chunks 數量。
-
-| 指標 | 傳統逐一檢查 | Prompt Skipper |
-|------|-------------|----------------|
-| **API 呼叫輪數** | O(N) | O(log N) |
-| **最差 API 總呼叫數** | N | 2N − 1 |
-| **最佳 API 總呼叫數** | N | 2 |
-| **平行度** | 無 | 每輪全部平行 |
-
-> **輪數說明**：有 N 個 chunks 時，樹高為 log₂N，因此只需 log₂N 輪。
-> 例如 1024 個 chunks → 最多 10 輪（而非 1024 輪）。
-
-### 早期剪枝
-
-當某個子樹被判定為「不相關」，整棵子樹立即被丟棄，不再往下遞迴。
-相關 chunks 越稀疏，節省越多。
-
----
-
-## 實作架構
-
-```
-prompt_skipper.py
-├── SkipperConfig          資料類別，存放模型設定
-├── FilterStats            統計：輪數、API 呼叫數、chunk 存活率
-├── _check_relevance()     對一組 chunks 問「是否有任何相關？」→ YES/NO
-├── _filter_recursive()    核心遞迴函式
-├── filter_chunks()        公開 API：只做過濾
-└── ask()                  公開 API：過濾 + 最終回答
-```
-
-### `_check_relevance` 的 prompt 設計
-
-只問「**這組 chunks 裡有沒有任何一個**和 query 相關」，而非「哪個最相關」。
-這讓我們可以：
-1. 使用便宜快速的小模型（如 `gpt-4o-mini`）
-2. 限制輸出 token 數到 10（只需 YES/NO）
-3. 批次檢查多個 chunks，降低 API 呼叫總次數
-
----
-
-## 兩個公開 API
-
-### `filter_chunks` — 只過濾
-
-```python
-from prompt_skipper import filter_chunks, SkipperConfig
+chunks = [...]   # your RAG chunks
+query  = "your question"
 
 config = SkipperConfig(
     base_url="https://api.openai.com/v1",
     api_key="sk-...",
-    filter_model="gpt-4o-mini",
-    answer_model="gpt-4o",
-    leaf_size=1,
+    filter_model="gpt-4o-mini",   # cheap/fast model for YES/NO filtering
+    answer_model="gpt-4o",        # capable model for final answer
 )
 
-relevant_chunks, stats = await filter_chunks(chunks, query, config)
-
+answer, stats = asyncio.run(ask(chunks, query, config))
+print(answer)
 print(stats)
 # rounds=4 | api_calls=14 | chunks: 16 → 4 (12 pruned)
 ```
 
-### `ask` — 完整 pipeline
+---
+
+## API Reference
+
+### `filter_chunks` — filter only (Strategy A)
 
 ```python
-from prompt_skipper import ask, SkipperConfig
+relevant_chunks, stats = await filter_chunks(chunks, query, config)
+```
 
+### `filter_chunks_by_marker` — filter only (Strategy B)
+
+```python
+relevant_chunks, stats = await filter_chunks_by_marker(chunks, query, config)
+```
+
+### `filter_chunks_by_marker_parallel` — filter only (Strategy C)
+
+```python
+relevant_chunks, stats = await filter_chunks_by_marker_parallel(
+    chunks, query, config, num_workers=4
+)
+```
+
+### `ask` — full pipeline (Strategy A)
+
+```python
 answer, stats = await ask(chunks, query, config)
 ```
 
-內部流程：
+### `ask_with_marker` — full pipeline (Strategy B or C)
 
-```
-chunks → filter_chunks() → 相關 chunks → 強力模型 → 回答
-                ↑                              ↑
-           gpt-4o-mini                      gpt-4o
-          （便宜、快速）                  （準確、完整）
+```python
+answer, stats = await ask_with_marker(chunks, query, config, parallel=False)
+answer, stats = await ask_with_marker(chunks, query, config, parallel=True, num_workers=4)
 ```
 
 ---
 
-## 設定選項
+## Configuration
 
 ```python
 @dataclass
 class SkipperConfig:
-    base_url: str        # 任何 OpenAI compatible endpoint
+    base_url: str         # any OpenAI-compatible endpoint
     api_key: str
-    filter_model: str    # 用於 YES/NO 判斷的輕量模型
-    answer_model: str    # 用於最終回答的強力模型
-    leaf_size: int = 1   # 遞迴到幾個 chunk 時停止拆分
+    filter_model: str     # lightweight model for relevance checks
+    answer_model: str     # capable model for the final answer
+    leaf_size: int = 1    # stop recursing at this group size (Strategy A only)
 ```
 
-**`leaf_size` 的影響：**
+**`leaf_size` guide (Strategy A):**
 
-| leaf_size | 行為 | 適合情境 |
-|-----------|------|---------|
-| `1` | 精確到單一 chunk | 預設，最精準 |
-| `3`–`5` | 以小組為單位保留 | chunks 很短、相關性分散時 |
-| 太大 | 退化成單次全量檢查 | 失去分治優勢 |
+| leaf_size | Behavior | When to use |
+|-----------|----------|-------------|
+| `1` | Exact single-chunk precision | Default — most accurate |
+| `3`–`5` | Keep small groups together | Short chunks, scattered relevance |
+| Too large | Degrades to single full check | Loses divide & conquer benefit |
 
 ---
 
-## 接不同服務
+## Compatible Endpoints
 
-因為使用 `openai` 套件的 `base_url` 參數，可以接任何相容的服務：
+Uses the `openai` package's `base_url` parameter — works with any OpenAI-compatible API:
 
 ```python
 # OpenAI
 config = SkipperConfig(base_url="https://api.openai.com/v1", api_key="sk-...")
 
-# Ollama（本地）
+# Ollama (local)
 config = SkipperConfig(base_url="http://localhost:11434/v1", api_key="ollama",
                        filter_model="llama3.2", answer_model="llama3.1:70b")
 
@@ -190,7 +205,7 @@ config = SkipperConfig(base_url="http://localhost:11434/v1", api_key="ollama",
 config = SkipperConfig(base_url="https://<resource>.openai.azure.com/openai/deployments/<model>",
                        api_key="<azure-key>")
 
-# Anthropic（透過相容層）
+# Anthropic (via compatibility layer)
 config = SkipperConfig(base_url="https://api.anthropic.com/v1",
                        api_key="<anthropic-key>",
                        filter_model="claude-haiku-4-5-20251001",
@@ -199,47 +214,36 @@ config = SkipperConfig(base_url="https://api.anthropic.com/v1",
 
 ---
 
-## 使用限制與注意事項
+## When to Use Each Strategy
 
-**何時效果最好：**
-- Chunks 數量多（> 20）
-- 相關 chunks 佔少數（稀疏分布）
-- 需要控制最終 prompt 的長度
+| Strategy | Best for |
+|----------|---------|
+| **A — Divide & Conquer** | Limited context windows; cheap small filter models; many parallel requests acceptable |
+| **B — Marker Streaming** | Large context models (e.g. gemma3:27b, GPT-4o); single powerful server; fastest overall |
+| **C — Parallel Marker** | Multi-GPU Ollama servers; want to balance load across parallel inference slots |
 
-**何時效果有限：**
-- Chunks 數量很少（< 8），分治優勢不明顯
-- 相關 chunks 佔多數（大量剪枝機會不存在）
-- Chunks 之間關聯性強，拆開後 YES/NO 判斷不準確
+**Works best when:**
+- You have many chunks (> 20)
+- Relevant chunks are sparse (< 30% of total)
+- You need to control final prompt length
 
-**`leaf_size=1` 的邊界情況：**
-單一 chunk 判斷可能比「一組相關 chunks 一起判斷」更不準確，
-因為單一句子缺乏上下文。可考慮 `leaf_size=2` 或 `3` 來緩解。
+**Less effective when:**
+- Very few chunks (< 8)
+- Most chunks are relevant (little to prune)
+- Chunks are strongly interdependent (splitting hurts YES/NO accuracy)
 
 ---
 
-## 快速開始
+## Repository Structure
 
-```bash
-pip install openai
 ```
-
-```python
-import asyncio
-from prompt_skipper import ask, SkipperConfig
-
-chunks = [...]   # 你的 RAG chunks
-query = "你的問題"
-
-config = SkipperConfig(
-    base_url="https://api.openai.com/v1",
-    api_key="your-key",
-    filter_model="gpt-4o-mini",
-    answer_model="gpt-4o",
-)
-
-answer, stats = asyncio.run(ask(chunks, query, config))
-print(answer)
-print(stats)
+prompt_skipper.py          # original implementation (Strategy A)
+example.py                 # basic usage example
+token saver/
+├── prompt_skipper.py      # full implementation (Strategies A, B, C)
+├── example.py             # basic usage
+├── example_ollama.py      # Ollama-specific example
+├── benchmark_large.py     # large-file stress test script
+├── sanity_check.py        # pruning accuracy validation
+└── benchmark_result.txt   # raw benchmark output
 ```
-
-完整範例見 [`example.py`](example.py)。
